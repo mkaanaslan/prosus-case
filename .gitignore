@@ -1,0 +1,21 @@
+# Exclude   
+*
+data/5k_items_curated.csv
+data/test.json
+
+
+# Include
+!embeddings/
+!embeddings/**
+!data/
+!data/**
+!preds/
+!preds/**
+!results/
+!results/**
+!utils/
+!utils/**
+!baseline.py
+!.gitignore
+.DS_Store
+**/.DS_Store
