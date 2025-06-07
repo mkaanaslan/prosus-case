@@ -259,4 +259,6 @@ if __name__ == "__main__":
             all_results.append(cur_res)
 
         all_results = pd.DataFrame(all_results)
-        all_results.to_csv(RESULTS_DIR / "results.csv", index=False)
+        all_results.to_csv(RESULTS_DIR / "baseline_results.csv", index=False)
+        with open(RESULTS_DIR / "baseline_results.md", "w") as f:
+            f.write(all_results.to_markdown())
