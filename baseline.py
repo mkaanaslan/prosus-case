@@ -149,6 +149,43 @@ def search_index(query: str, index_name: str, top_k: int = 10):
     return {"_id":   [IDMAP[i] for i in indices[0]],
             "score": [float(s)  for s in scores[0]]}
 
+# ------------------ weighted-RRF helpers ------------------ #
+def wrrf_fuse(rank_lists, weights, k: int = 60, top_k: int = 100):
+    """
+    Weighted Reciprocal Rank Fusion: score = w / (k + rank).
+    `weights` must be the same length as `rank_lists`.
+    """
+    scores = {}
+    for lst, w in zip(rank_lists, weights):
+        for r, doc_id in enumerate(lst):
+            scores[doc_id] = scores.get(doc_id, 0) + w / (k + r + 1)
+    fused = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [doc_id for doc_id, _ in fused[:top_k]]
+
+
+def get_wrrf_predictions(idx_a: str, idx_b: str,
+                         w_a: float, w_b: float,
+                         k: int = 60, top_k: int = 100):
+    """
+    Build & save a weighted-RRF run; returns its run-name.
+    """
+    pa, pb = PRED_DIR / f"{idx_a}_preds.json", PRED_DIR / f"{idx_b}_preds.json"
+    with open(pa, "r", encoding="utf8") as fa, open(pb, "r", encoding="utf8") as fb:
+        ta, tb = json.load(fa), json.load(fb)
+
+    fused = []
+    for qa, qb in zip(ta, tb):
+        fused_preds = wrrf_fuse([qa["preds"], qb["preds"]],
+                                weights=[w_a, w_b],
+                                k=k, top_k=top_k)
+        fused.append({"_id": qa["_id"], "query": qa["query"], "preds": fused_preds})
+
+    run_name = f"wrrf_k{k}_w{int(w_b*100)}_{idx_a}_{idx_b}"
+    with open(PRED_DIR / f"{run_name}_preds.json", "w", encoding="utf8") as f:
+        json.dump(fused, f, ensure_ascii=False, indent=0)
+    return run_name
+
+
 
 # ---------------------- prediction + metrics ----------------------- #
 def get_predictions(index_name: str, top_k: int = 10):
@@ -257,6 +294,32 @@ if __name__ == "__main__":
             get_predictions(index_name=idx, top_k=100)
             cur_res = get_results(preds_path=PRED_DIR / f"{idx}_preds.json")
             all_results.append(cur_res)
+
+        grid_results = []
+        anchor_idx   = "bm25_name"
+        anchor_r30  = pd.DataFrame(all_results).loc[pd.DataFrame(all_results).type == f"{anchor_idx}_preds",
+                                        "Recall@30"].iloc[0]
+
+        k_grid = [20, 40, 60, 80]
+        w_grid = [0.25, 0.5, 0.75, 1.0]
+        best_pair, best_r30 = None, anchor_r30
+
+        for k_val in k_grid:
+            for w_emb in w_grid:
+                run_name = get_wrrf_predictions(anchor_idx, "nlp",
+                                                w_a=1.0, w_b=w_emb,
+                                                k=k_val, top_k=100)
+                res = get_results(PRED_DIR / f"{run_name}_preds.json")
+                grid_results.append(res)
+                os.remove(PRED_DIR / f"{run_name}_preds.json")
+
+                if res["Recall@30"] > best_r30:
+                    best_pair, best_r30, best_res = run_name, res["Recall@30"], res
+
+        with open(RESULTS_DIR / "baseline_grid_wrrf.md", "w") as f:
+            f.write(pd.DataFrame(grid_results).to_markdown())
+        print(f"Best weighted-RRF run: {best_pair}  (Recall@30 = {best_r30:.3f})")
+        all_results.append(best_res)
 
         all_results = pd.DataFrame(all_results)
         all_results.to_csv(RESULTS_DIR / "baseline_results.csv", index=False)
