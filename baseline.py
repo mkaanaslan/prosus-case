@@ -35,9 +35,25 @@ def get_metadata(row):
         "ordering_rate": {**profile['metrics']['orderingRate']['day'], **profile['metrics']['orderingRate']['shift']},
     }
 
+def filter_test(items_list):
+    TEST['relevant_items'] = TEST['relevant_items'].apply(lambda x: pd.DataFrame(x).to_dict('records'))
+    name_to_id_map = pd.Series(META_DATA._id.values, index=META_DATA.name).to_dict()
+    enriched_list = []
+    for item in items_list:
+        item_id = name_to_id_map.get(item.get('name'))
+        if item_id:
+            item['_id'] = item_id
+            enriched_list.append(item)
+    return enriched_list
+
 DATA       = pd.read_csv(CSV_PATH)
 META_DATA  = DATA.apply(get_metadata, axis=1, result_type="expand")
 IDMAP        = DATA["_id"].tolist()
+
+with open(TEST_PATH, "r", encoding="utf8") as f:
+    TEST = pd.DataFrame(json.load(f))
+
+TEST['relevant_items'] = TEST['relevant_items'].apply(filter_test)
 
 
 def describe_ordering_pattern(probs: dict[str, float],
@@ -184,72 +200,71 @@ def wrrf_fuse(rank_lists, weights, k: int = 60, top_k: int = 100):
     fused = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [doc_id for doc_id, _ in fused[:top_k]]
 
-
-def get_wrrf_predictions(idx_a: str, idx_b: str,
-                         w_a: float, w_b: float,
-                         k: int = 60, top_k: int = 100):
-    pa, pb = PRED_DIR / f"{idx_a}_preds.json", PRED_DIR / f"{idx_b}_preds.json"
-    with open(pa, "r", encoding="utf8") as fa, open(pb, "r", encoding="utf8") as fb:
-        ta, tb = json.load(fa), json.load(fb)
-
-    fused = []
-    for qa, qb in zip(ta, tb):
-        fused_preds = wrrf_fuse([qa["preds"], qb["preds"]],
-                                weights=[w_a, w_b],
-                                k=k, top_k=top_k)
-        fused.append({"_id": qa["_id"], "query": qa["query"], "preds": fused_preds})
-
-    run_name = f"wrrf_k{k}_w{int(w_b*100)}_{idx_a}_{idx_b}"
-    with open(PRED_DIR / f"{run_name}_preds.json", "w", encoding="utf8") as f:
-        json.dump(fused, f, ensure_ascii=False, indent=0)
-    return run_name
-
-# ---------------------- prediction + metrics ----------------------- #
+# ---------------------- evaluation ----------------------- #
 def get_predictions(index_name: str,
-                    top_k: int = 10,
+                    top_k: int = 100,
                     chunk_size: int = 128,
                     verbose: bool = False):
-    with open(TEST_PATH, "r", encoding="utf8") as f:
-        test = json.load(f)
+
+    test_df = TEST.copy()
 
     if index_name.startswith("bm25"):
-        for i, item in enumerate(test):
-            res = search_bm25_index(item["query"], index_name, top_k)
-            test[i]["preds"] = res["_id"]
+        test_df["preds"] = test_df["query_text"].apply(
+            lambda q: search_bm25_index(q, index_name, top_k)["_id"]
+        )
     else:
-        queries = [item["query"] for item in test]
-        batch_results = search_index(
+        queries = test_df["query_text"].tolist()
+        batch   = search_index(
             queries,
             index_name=index_name,
             top_k=top_k,
             chunk_size=chunk_size,
-            verbose=verbose
+            verbose=verbose,
         )
-        for item, res in zip(test, batch_results):
-            item["preds"] = res["_id"]
+        test_df["preds"] = [res["_id"] for res in batch]
 
     out_path = PRED_DIR / f"{index_name}_preds.json"
-    with open(out_path, "w", encoding="utf8") as f:
-        json.dump(test, f, ensure_ascii=False, indent=0)
-
+    test_df.to_json(out_path, orient="records", force_ascii=False, indent=0)
     print(f"✓ Saved predictions for '{index_name}' to {out_path}")
 
 
-def get_results(preds_path: str):
-    with open(preds_path, "r", encoding="utf8") as f:
-        test = json.load(f)
+def get_results(preds_path: Path):
+    ks = [1, 3, 5, 10, 20, 30, 50, 100]
 
-    recalls = {1: 0, 3: 0, 5: 0, 10: 0, 20:0, 30:0, 50:0, 100:0}
+    with open(preds_path, "r", encoding="utf8") as f:
+        test = json.load(f)                       
+
+    recalls = {k: 0.0 for k in ks} 
+    ndcgs   = {k: 0.0 for k in ks}
+
     for item in test:
-        for k in recalls:
-            if item["_id"] in item["preds"][:k]:
-                recalls[k] += 1
+        rel = {ri["_id"]: ri["relevance_score"] for ri in item["relevant_items"]}
+
+        for k in ks:
+            preds_k = item["preds"][:k]
+
+            # ---------- Recall (fractional) ----------
+            hits = sum(1 for pid in preds_k if pid in rel)
+            recalls[k] += hits / len(rel) if rel else 0.0
+
+            # ---------- nDCG ----------
+            dcg = 0.0
+            for rank, pid in enumerate(preds_k, start=1):
+                r = rel.get(pid, 0)
+                if r:
+                    dcg += (2 ** r - 1) / np.log2(rank + 1)
+
+            ideal = sorted(rel.values(), reverse=True)[:k]
+            idcg  = sum((2 ** r - 1) / np.log2(rank + 1)
+                        for rank, r in enumerate(ideal, start=1))
+            ndcgs[k] += dcg / idcg if idcg else 0.0
 
     total = len(test)
-    res   = {f"Recall@{k}": recalls[k] / total for k in recalls}
-    res['type'] = preds_path.stem
+    results = {f"Recall@{k}": recalls[k] / total for k in ks} | {
+              f"nDCG@{k}":   ndcgs[k]   / total for k in ks}
+    results["type"] = preds_path.stem
+    return results
 
-    return res
 
 
 if __name__ == "__main__":
@@ -318,15 +333,18 @@ if __name__ == "__main__":
         # ------------------------ evaluation loop -------------------------- #
         all_indices = [
             "name", "taxonomy", "co_purchase", "search", "full",
-            "bm25_name", "bm25_name_taxonomy", "bm25_full", "nlp", "bm25_nlp" 
+            "bm25_name", "bm25_name_taxonomy", "bm25_full", "nlp", "bm25_nlp"
         ]
 
         all_results = []
         for idx in all_indices:
             get_predictions(index_name=idx, top_k=100)
-            cur_res = get_results(preds_path=PRED_DIR / f"{idx}_preds.json")
+            cur_res = get_results(PRED_DIR / f"{idx}_preds.json")
             all_results.append(cur_res)
 
-        pd.DataFrame(all_results).to_csv(RESULTS_DIR / "baseline_results.csv", index=False)
-        with open(RESULTS_DIR / "baseline_results.md", "w") as f:
-            f.write(pd.DataFrame(all_results).to_markdown())
+        df = pd.DataFrame(all_results)
+        df.to_csv(RESULTS_DIR / "baseline_results.csv", index=False)
+        with open(RESULTS_DIR / "baseline_results.md", "w", encoding="utf8") as f:
+            f.write(df.to_markdown(index=False))
+
+        print(f"✓ Evaluation saved to {RESULTS_DIR}/baseline_results.[csv|md]")
