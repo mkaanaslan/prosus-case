@@ -1,7 +1,5 @@
 # Exclude   
 *
-data/5k_items_curated.csv
-data/test.json
 
 # Include
 !embeddings/
@@ -18,3 +16,6 @@ data/test.json
 !.gitignore
 .DS_Store
 **/.DS_Store
+
+data/5k_items_curated.csv
+data/queries.csv
