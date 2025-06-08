@@ -6,19 +6,17 @@ from rank_bm25 import BM25Okapi
 import faiss
 import pandas as pd
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
+import litellm
+from typing import Union, List, Dict, Any
 
 UPDATE      = True
 CSV_PATH    = Path("data/5k_items_curated.csv")
-MODEL_NAME  = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_NAME  = "text-embedding-3-large"
 VEC_DIR     = Path("embeddings");  VEC_DIR.mkdir(exist_ok=True)
 PRED_DIR    = Path("preds");       PRED_DIR.mkdir(exist_ok=True)
 TEST_PATH   = Path("data/test.json")
 RESULTS_DIR = Path("results");     RESULTS_DIR.mkdir(exist_ok=True)
-SEED        = 42
-
-MODEL = SentenceTransformer(MODEL_NAME)
 
 # -------------------------- data loading --------------------------- #
 
@@ -122,16 +120,28 @@ def search_bm25_index(query: str, index_name: str, top_k: int = 10):
 
 
 # ------------------------- FAISS helpers --------------------------- #
-def get_embeddings(texts, verbose=False):
-    return MODEL.encode(texts,
-                        batch_size=128,
-                        show_progress_bar=verbose,
-                        normalize_embeddings=True)
+def get_embeddings(texts, chunk_size: int = 128, verbose: bool = False):
+    texts = [t if str(t).strip() else "None" for t in texts]
+    all_embs = []
+    for start in tqdm(range(0, len(texts), chunk_size), disable=not verbose):
+        chunk = texts[start:start + chunk_size]
+        resp = litellm.embedding(
+            model=MODEL_NAME,
+            input=chunk,
+            api_base=os.environ["LITELLM_API_BASE"],
+            api_key=os.environ["LITELLM_API_KEY"],
+        )
+        embs = np.array([d["embedding"] for d in resp["data"]], dtype=np.float32)
+        all_embs.append(embs)
+
+    embeddings = np.vstack(all_embs)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    return embeddings / np.clip(norms, 1e-12, None)
 
 
-def build_index(texts, index_name):
+def build_index(texts, index_name, chunk_size = 128):
     index_path = VEC_DIR / f"{index_name}.faiss"
-    embeddings = get_embeddings(texts, verbose=True)
+    embeddings = get_embeddings(texts, chunk_size=chunk_size, verbose=True)
     dim        = embeddings.shape[1]
 
     idx = faiss.IndexFlatIP(dim)
@@ -139,22 +149,34 @@ def build_index(texts, index_name):
     faiss.write_index(idx, str(index_path))
     print(f"✓ Built and saved index '{index_name}' with {idx.ntotal} vectors")
 
+def search_index(queries: Union[str, List[str]],
+                 index_name: str,
+                 top_k: int = 10,
+                 chunk_size: int = 128,
+                 verbose: bool = False
+                 ) -> List[Dict[str, Any]]:
+    if isinstance(queries, str):
+        queries = [queries]
 
-def search_index(query: str, index_name: str, top_k: int = 10):
-    qvec       = get_embeddings([query])
+    q_embs = get_embeddings(queries, chunk_size=chunk_size, verbose=verbose)
+
     index_path = VEC_DIR / f"{index_name}.faiss"
-    idx        = faiss.read_index(str(index_path))
+    idx = faiss.read_index(str(index_path))
 
-    scores, indices = idx.search(qvec, top_k)
-    return {"_id":   [IDMAP[i] for i in indices[0]],
-            "score": [float(s)  for s in scores[0]]}
+    scores, indices = idx.search(q_embs, top_k)
+
+    results = []
+    for row_scores, row_idxs in zip(scores, indices):
+        results.append({
+            "_id":   [IDMAP[i]   for i in row_idxs],
+            "score": [float(s)    for s in row_scores],
+        })
+
+    return results
+
 
 # ------------------ weighted-RRF helpers ------------------ #
 def wrrf_fuse(rank_lists, weights, k: int = 60, top_k: int = 100):
-    """
-    Weighted Reciprocal Rank Fusion: score = w / (k + rank).
-    `weights` must be the same length as `rank_lists`.
-    """
     scores = {}
     for lst, w in zip(rank_lists, weights):
         for r, doc_id in enumerate(lst):
@@ -166,9 +188,6 @@ def wrrf_fuse(rank_lists, weights, k: int = 60, top_k: int = 100):
 def get_wrrf_predictions(idx_a: str, idx_b: str,
                          w_a: float, w_b: float,
                          k: int = 60, top_k: int = 100):
-    """
-    Build & save a weighted-RRF run; returns its run-name.
-    """
     pa, pb = PRED_DIR / f"{idx_a}_preds.json", PRED_DIR / f"{idx_b}_preds.json"
     with open(pa, "r", encoding="utf8") as fa, open(pb, "r", encoding="utf8") as fb:
         ta, tb = json.load(fa), json.load(fb)
@@ -185,22 +204,35 @@ def get_wrrf_predictions(idx_a: str, idx_b: str,
         json.dump(fused, f, ensure_ascii=False, indent=0)
     return run_name
 
-
-
 # ---------------------- prediction + metrics ----------------------- #
-def get_predictions(index_name: str, top_k: int = 10):
+def get_predictions(index_name: str,
+                    top_k: int = 10,
+                    chunk_size: int = 128,
+                    verbose: bool = False):
     with open(TEST_PATH, "r", encoding="utf8") as f:
         test = json.load(f)
 
-    for i, item in enumerate(test):
-        if index_name.startswith("bm25"):
+    if index_name.startswith("bm25"):
+        for i, item in enumerate(test):
             res = search_bm25_index(item["query"], index_name, top_k)
-        else:
-            res = search_index(item["query"], index_name, top_k)
-        test[i]["preds"] = res["_id"]
+            test[i]["preds"] = res["_id"]
+    else:
+        queries = [item["query"] for item in test]
+        batch_results = search_index(
+            queries,
+            index_name=index_name,
+            top_k=top_k,
+            chunk_size=chunk_size,
+            verbose=verbose
+        )
+        for item, res in zip(test, batch_results):
+            item["preds"] = res["_id"]
 
-    with open(PRED_DIR / f"{index_name}_preds.json", "w", encoding="utf8") as f:
+    out_path = PRED_DIR / f"{index_name}_preds.json"
+    with open(out_path, "w", encoding="utf8") as f:
         json.dump(test, f, ensure_ascii=False, indent=0)
+
+    print(f"✓ Saved predictions for '{index_name}' to {out_path}")
 
 
 def get_results(preds_path: str):
@@ -295,33 +327,6 @@ if __name__ == "__main__":
             cur_res = get_results(preds_path=PRED_DIR / f"{idx}_preds.json")
             all_results.append(cur_res)
 
-        grid_results = []
-        anchor_idx   = "bm25_name"
-        anchor_r30  = pd.DataFrame(all_results).loc[pd.DataFrame(all_results).type == f"{anchor_idx}_preds",
-                                        "Recall@30"].iloc[0]
-
-        k_grid = [20, 40, 60, 80]
-        w_grid = [0.25, 0.5, 0.75, 1.0]
-        best_pair, best_r30 = None, anchor_r30
-
-        for k_val in k_grid:
-            for w_emb in w_grid:
-                run_name = get_wrrf_predictions(anchor_idx, "nlp",
-                                                w_a=1.0, w_b=w_emb,
-                                                k=k_val, top_k=100)
-                res = get_results(PRED_DIR / f"{run_name}_preds.json")
-                grid_results.append(res)
-                os.remove(PRED_DIR / f"{run_name}_preds.json")
-
-                if res["Recall@30"] > best_r30:
-                    best_pair, best_r30, best_res = run_name, res["Recall@30"], res
-
-        with open(RESULTS_DIR / "baseline_grid_wrrf.md", "w") as f:
-            f.write(pd.DataFrame(grid_results).to_markdown())
-        print(f"Best weighted-RRF run: {best_pair}  (Recall@30 = {best_r30:.3f})")
-        all_results.append(best_res)
-
-        all_results = pd.DataFrame(all_results)
-        all_results.to_csv(RESULTS_DIR / "baseline_results.csv", index=False)
+        pd.DataFrame(all_results).to_csv(RESULTS_DIR / "baseline_results.csv", index=False)
         with open(RESULTS_DIR / "baseline_results.md", "w") as f:
-            f.write(all_results.to_markdown())
+            f.write(pd.DataFrame(all_results).to_markdown())
