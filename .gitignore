@@ -16,6 +16,7 @@
 !improved.py
 !main.py
 !.gitignore
+!requirements.txt
 .DS_Store
 **/.DS_Store
 
