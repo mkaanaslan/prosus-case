@@ -18,6 +18,17 @@ This repository contains code for running a recommendation/embedding-based exper
    pip install -r requirements.txt
    ```
 
+## Environment
+
+The application uses environment variables for API configuration. Create a `.env` file in the root of the repository with the following entries:
+
+```env
+LITELLM_API_KEY=YOUR_API_KEY_HERE
+LITELLM_API_BASE=YOUR_API_BASE_URL_HERE
+```
+
+Ensure you replace the placeholder values with your actual API key and base URL.
+
 ## Data Preparation
 
 Before running any script, make sure you have the dataset file:
@@ -34,7 +45,7 @@ Before running any script, make sure you have the dataset file:
 The `main.py` script uses pre-generated embeddings and runs the complete pipeline end-to-end.
 
 ```bash
-streamlit run main.py
+python main.py
 ```
 
 Results will be saved in the default output directory, and logs will be printed to the console.
