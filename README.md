@@ -34,7 +34,7 @@ Before running any script, make sure you have the dataset file:
 The `main.py` script uses pre-generated embeddings and runs the complete pipeline end-to-end.
 
 ```bash
-python main.py
+streamlit run main.py
 ```
 
 Results will be saved in the default output directory, and logs will be printed to the console.
