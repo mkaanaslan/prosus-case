@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 import litellm
 from typing import Union, List, Dict, Any
 
-UPDATE      = True
+UPDATE      = False
 CSV_PATH    = Path("data/5k_items_curated.csv")
 MODEL_NAME  = "text-embedding-3-large"
 VEC_DIR     = Path("embeddings");  VEC_DIR.mkdir(exist_ok=True)
@@ -189,16 +189,6 @@ def search_index(queries: Union[str, List[str]],
         })
 
     return results
-
-
-# ------------------ weighted-RRF helpers ------------------ #
-def wrrf_fuse(rank_lists, weights, k: int = 60, top_k: int = 100):
-    scores = {}
-    for lst, w in zip(rank_lists, weights):
-        for r, doc_id in enumerate(lst):
-            scores[doc_id] = scores.get(doc_id, 0) + w / (k + r + 1)
-    fused = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    return [doc_id for doc_id, _ in fused[:top_k]]
 
 # ---------------------- evaluation ----------------------- #
 def get_predictions(index_name: str,

@@ -13,6 +13,8 @@
 !utils/
 !utils/**
 !baseline.py
+!improved.py
+!main.py
 !.gitignore
 .DS_Store
 **/.DS_Store
